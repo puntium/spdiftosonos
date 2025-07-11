@@ -1,0 +1,17 @@
+[project]
+name = "spdiftosonos2"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "aiohttp",
+    "sounddevice",
+    "soco",
+    "toml",
+    "click",
+    "structlog",
+]
+
+[tool.uv]
+dev-dependencies = []
