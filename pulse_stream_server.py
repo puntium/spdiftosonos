@@ -13,10 +13,11 @@ from soco import SoCo, discover
 from soco.exceptions import SoCoException
 
 DEFAULT_PORT = 8080
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 48000
 CHANNELS = 2
-BITRATE = "192k"
-METADATA_INTERVAL = 100000
+BITRATE = "320k"
+CAPTURE_DEVICE = "shared_capture"
+# METADATA_INTERVAL = 100000  # No longer needed without ICY metadata
 
 class StreamHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.0'  # Use HTTP/1.0 for better streaming compatibility
@@ -24,12 +25,13 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         if self.path == '/stream.mp3':
             self.send_response(200)
             self.send_header('Content-Type', 'audio/mpeg')
-            self.send_header('Content-Length', str(10 * 1024 * 1024 * 1024))  # 10GB fake length
+            # Try a much larger fake length to see if it helps
+            # Some users report 100GB works better than 10GB
+            self.send_header('Content-Length', str(100 * 1024 * 1024 * 1024))  # 100GB fake length
             self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'close')
-            # ICY metadata headers
-            self.send_header('icy-metaint', str(METADATA_INTERVAL))  # Metadata every 16KB
-            self.send_header('icy-name', 'PulseAudio Stream')
+            # Try keep-alive instead of close to prevent early disconnection
+            self.send_header('Connection', 'keep-alive')
+            # No ICY metadata needed for SPDIF stream
             self.end_headers()
             
             # Use PulseAudio input instead of ALSA
@@ -37,16 +39,26 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
             # You can also specify a specific source with -i pulse:source_name
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-thread_queue_size', '4096',
-                '-f', 'pulse',
-                '-i', 'default',  # Use default PulseAudio source
-                '-acodec', 'mp3',
+                '-nostdin',  # Prevent terminal state corruption
+                '-loglevel', 'verbose',  # Verbose logging to diagnose delays
+                '-stats',  # Show real-time encoding statistics
+                '-thread_queue_size', '4096',  # Doubled input buffer
+                '-re',
+                '-f', 'alsa',
+                '-ar', '44100',  # Force input to be interpreted as 44.1kHz
+                '-i', CAPTURE_DEVICE,  # Use default PulseAudio source
+                '-acodec', 'libmp3lame',
+                '-compression_level', '0',  # Fastest encoding, lowest compression
                 '-b:a', BITRATE,
-                '-ar', str(SAMPLE_RATE),
+                '-ar', str(SAMPLE_RATE),  # Output sample rate (44100)
                 '-ac', str(CHANNELS),
                 '-f', 'mp3',
                 '-flush_packets', '0',
                 '-fflags', 'nobuffer',
+                # Add more aggressive buffering to ensure consistent data flow
+                # Real-time encoding settings
+                '-rtbufsize', '100M',  # Large real-time buffer
+                # Removed -preset ultrafast as it's for video encoding
                 '-'
             ]
             
@@ -56,51 +68,97 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                 process = subprocess.Popen(
                     ffmpeg_cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    bufsize=65536  # Larger buffer for more efficient reads
+                    stderr=subprocess.PIPE,  # Capture stderr for diagnostics
+                    bufsize=1048576  # 1MB buffer for smoother reads
                 )
+                
+                # Monitor ffmpeg stderr in a separate thread
+                def monitor_ffmpeg_stderr():
+                    for line in process.stderr:
+                        if line:
+                            timestamp = time.strftime('%H:%M:%S.%f')[:-3]
+                            print(f"[{timestamp}] FFmpeg: {line.decode('utf-8').strip()}")
+                
+                stderr_thread = threading.Thread(target=monitor_ffmpeg_stderr)
+                stderr_thread.daemon = True
+                stderr_thread.start()
                 
                 try:
                     bytes_sent = 0
                     last_log_kb = 0
-                    chunk_size = 32768  # Read 32KB at a time
-                    metadata_interval = METADATA_INTERVAL  # ICY metadata interval
-                    bytes_until_metadata = metadata_interval
+                    chunk_size = 2048  # 8KB chunks
+                    
+                    # Track read timing statistics
+                    read_times = []  # Track read durations
+                    slow_read_threshold = 0.1  # 100ms threshold
+                    
+                    # Pre-buffer 2 seconds of audio
+                    # At 320kbps = 40KB/s, so 2 seconds = 80KB
+                    prebuffer_size = 40960  # 80KB for 2 seconds at 320kbps
+                    print(f"Pre-buffering {prebuffer_size // 1024}KB (2 seconds) before starting stream...")
+                    prebuffer = b''
+                    prebuffer_start = time.time()
+                    
+                    while len(prebuffer) < prebuffer_size:
+                        data = process.stdout.read(8192)
+                        if not data:
+                            break
+                        prebuffer += data
+                    
+                    prebuffer_duration = time.time() - prebuffer_start
+                    print(f"Pre-buffered {len(prebuffer) // 1024}KB in {prebuffer_duration:.2f}s")
+                    
+                    # Send the pre-buffered data
+                    if prebuffer:
+                        write_start = time.time()
+                        self.wfile.write(prebuffer)
+                        write_duration = time.time() - write_start
+                        bytes_sent = len(prebuffer)
+                        print(f"Sent initial {bytes_sent // 1024}KB buffer in {write_duration:.3f}s")
                     
                     while True:
-                        # Calculate how much to read before next metadata
-                        read_size = min(chunk_size, bytes_until_metadata)
-                        data = process.stdout.read(read_size)
+                        # Time the read operation
+                        read_start = time.time()
+                        data = process.stdout.read(chunk_size)
+                        read_duration = time.time() - read_start
+                        
+                        # Track read statistics
+                        read_times.append(read_duration)
+                        if read_duration > slow_read_threshold:
+                            timestamp = time.strftime('%H:%M:%S.%f')[:-3]
+                            print(f"[{timestamp}] SLOW READ WARNING: ffmpeg read took {read_duration:.3f}s (requested {chunk_size} bytes)")
+                        
+                        # Log statistics every 100 reads
+                        if len(read_times) >= 100:
+                            avg_read_time = sum(read_times) / len(read_times)
+                            max_read_time = max(read_times)
+                            slow_reads = sum(1 for t in read_times if t > slow_read_threshold)
+                            print(f"Read stats - Avg: {avg_read_time:.3f}s, Max: {max_read_time:.3f}s, Slow reads: {slow_reads}/100")
+                            read_times = []
+                        
                         if not data:
+                            print(f"WARNING: ffmpeg returned no data after {read_duration:.3f}s wait")
                             break
                         
                         # Send raw MP3 data (no chunked encoding)
+                        write_start = time.time()
                         self.wfile.write(data)
+                        write_duration = time.time() - write_start
+                        if write_duration > 0.05:  # 50ms threshold
+                            print(f"SLOW WRITE WARNING: network write took {write_duration:.3f}s for {len(data)} bytes")
                         
                         bytes_sent += len(data)
-                        bytes_until_metadata -= len(data)
                         
-                        # Insert ICY metadata if needed
-                        if bytes_until_metadata <= 0:
-                            # Send metadata block
-                            metadata = "StreamTitle='PulseAudio Stream';\0"
-                            # Pad to multiple of 16
-                            padding_needed = 16 - (len(metadata) % 16)
-                            if padding_needed < 16:
-                                metadata += '\0' * padding_needed
-                            
-                            # Send metadata length byte (divided by 16)
-                            metadata_length_byte = len(metadata) // 16
-                            self.wfile.write(bytes([metadata_length_byte]))
-                            self.wfile.write(metadata.encode('utf-8'))
-                            
-                            bytes_until_metadata = metadata_interval
-                        
-                        # Log every 10KB
+                        # Log every 10KB with more detail around 1MB mark
                         current_kb = bytes_sent // 10240
                         if current_kb > last_log_kb:
                             last_log_kb = current_kb
-                            print(f"Sent {current_kb * 10}KB to {self.client_address[0]}")
+                            total_kb = current_kb * 10
+                            # Extra logging around the 1MB mark where disconnects happen
+                            if 1000 <= total_kb <= 1200:
+                                print(f"[CRITICAL ZONE] Sent {total_kb}KB to {self.client_address[0]} - bytes_sent: {bytes_sent}")
+                            else:
+                                print(f"Sent {total_kb}KB to {self.client_address[0]}")
                     
                     print(f"Stream ended. Total sent: {bytes_sent / 1024:.1f}KB to {self.client_address[0]}")
                     

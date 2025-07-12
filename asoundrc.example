@@ -1,0 +1,18 @@
+pcm.shared_capture {
+    type dsnoop
+    ipc_key 5978293  # Choose a unique number; avoid conflicts with other plugins
+    ipc_key_add_uid yes  # Adds user ID for per-user uniqueness
+    slave {
+        pcm "hw:3,0"  # Replace with your actual hardware device, e.g., hw:1,0
+        channels 2  # Adjust for mono (1) or stereo (2)
+        period_size 1024
+        buffer_size 4096
+        rate 44100  # Sample rate; match your hardware or application needs
+        periods 0
+        period_time 0
+    }
+    bindings {
+        0 0
+        1 1  # Add more for additional channels if needed
+    }
+}
