@@ -16,15 +16,20 @@ DEFAULT_PORT = 8080
 SAMPLE_RATE = 44100
 CHANNELS = 2
 BITRATE = "192k"
+METADATA_INTERVAL = 100000
 
 class StreamHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.0'  # Use HTTP/1.0 for better streaming compatibility
     def do_GET(self):
         if self.path == '/stream.mp3':
             self.send_response(200)
             self.send_header('Content-Type', 'audio/mpeg')
-            self.send_header('Transfer-Encoding', 'chunked')
+            self.send_header('Content-Length', str(10 * 1024 * 1024 * 1024))  # 10GB fake length
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('Connection', 'close')
+            # ICY metadata headers
+            self.send_header('icy-metaint', str(METADATA_INTERVAL))  # Metadata every 16KB
+            self.send_header('icy-name', 'PulseAudio Stream')
             self.end_headers()
             
             # Use PulseAudio input instead of ALSA
@@ -32,6 +37,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
             # You can also specify a specific source with -i pulse:source_name
             ffmpeg_cmd = [
                 'ffmpeg',
+                '-thread_queue_size', '4096',
                 '-f', 'pulse',
                 '-i', 'default',  # Use default PulseAudio source
                 '-acodec', 'mp3',
@@ -39,6 +45,8 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                 '-ar', str(SAMPLE_RATE),
                 '-ac', str(CHANNELS),
                 '-f', 'mp3',
+                '-flush_packets', '0',
+                '-fflags', 'nobuffer',
                 '-'
             ]
             
@@ -56,32 +64,48 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                     bytes_sent = 0
                     last_log_kb = 0
                     chunk_size = 32768  # Read 32KB at a time
+                    metadata_interval = METADATA_INTERVAL  # ICY metadata interval
+                    bytes_until_metadata = metadata_interval
                     
                     while True:
-                        data = process.stdout.read(chunk_size)
+                        # Calculate how much to read before next metadata
+                        read_size = min(chunk_size, bytes_until_metadata)
+                        data = process.stdout.read(read_size)
                         if not data:
                             break
                         
-                        # Send chunk size in hex, followed by data, then CRLF
-                        chunk_header = f"{len(data):X}\r\n".encode()
-                        self.wfile.write(chunk_header)
+                        # Send raw MP3 data (no chunked encoding)
                         self.wfile.write(data)
-                        self.wfile.write(b"\r\n")
                         
                         bytes_sent += len(data)
+                        bytes_until_metadata -= len(data)
+                        
+                        # Insert ICY metadata if needed
+                        if bytes_until_metadata <= 0:
+                            # Send metadata block
+                            metadata = "StreamTitle='PulseAudio Stream';\0"
+                            # Pad to multiple of 16
+                            padding_needed = 16 - (len(metadata) % 16)
+                            if padding_needed < 16:
+                                metadata += '\0' * padding_needed
+                            
+                            # Send metadata length byte (divided by 16)
+                            metadata_length_byte = len(metadata) // 16
+                            self.wfile.write(bytes([metadata_length_byte]))
+                            self.wfile.write(metadata.encode('utf-8'))
+                            
+                            bytes_until_metadata = metadata_interval
                         
                         # Log every 10KB
-                        current_kb = bytes_sent // 100240
+                        current_kb = bytes_sent // 10240
                         if current_kb > last_log_kb:
                             last_log_kb = current_kb
-                            print(f"Sent {current_kb * 100}KB to {self.client_address[0]}")
+                            print(f"Sent {current_kb * 10}KB to {self.client_address[0]}")
                     
-                    # Send final chunk (0-sized chunk indicates end)
-                    self.wfile.write(b"0\r\n\r\n")
                     print(f"Stream ended. Total sent: {bytes_sent / 1024:.1f}KB to {self.client_address[0]}")
                     
-                except (BrokenPipeError, ConnectionResetError):
-                    print(f"Client {self.client_address[0]} disconnected after {bytes_sent / 1024:.1f}KB")
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    print(f"Client {self.client_address[0]} disconnected after {bytes_sent / 1024:.1f}KB: {type(e).__name__}")
                 finally:
                     process.terminate()
                     try:
@@ -196,11 +220,17 @@ def play_stream_on_sonos(sonos, stream_url):
         # Clear the queue
         sonos.clear_queue()
         
-        # Play the stream
-        # Use force_radio=True to ensure it's treated as a radio stream
-        sonos.play_uri(stream_url, title="PulseAudio Stream", force_radio=True)
+        # Convert http URL to x-rincon-mp3radio URL for better streaming
+        # This tells Sonos to use its radio streaming mode with better buffering
+        if stream_url.startswith('http://'):
+            radio_url = stream_url.replace('http://', 'x-rincon-mp3radio://', 1)
+        else:
+            radio_url = stream_url
         
-        print(f"Sonos is now playing the stream from {stream_url}")
+        # Play the stream using the radio URL format
+        sonos.play_uri(radio_url, title="PulseAudio Stream")
+        
+        print(f"Sonos is now playing the stream from {radio_url}")
         return True
     except Exception as e:
         print(f"Error playing stream on Sonos: {e}")
