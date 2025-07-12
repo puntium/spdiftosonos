@@ -13,7 +13,7 @@ from soco import SoCo, discover
 from soco.exceptions import SoCoException
 
 DEFAULT_PORT = 8080
-SAMPLE_RATE = 48000
+OUTPUT_SAMPLE_RATE = 44100
 CHANNELS = 2
 BITRATE = "320k"
 CAPTURE_DEVICE = "shared_capture"
@@ -34,9 +34,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
             # No ICY metadata needed for SPDIF stream
             self.end_headers()
             
-            # Use PulseAudio input instead of ALSA
-            # 'pulse' uses the default PulseAudio source
-            # You can also specify a specific source with -i pulse:source_name
+            # using alsa here 
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-nostdin',  # Prevent terminal state corruption
@@ -50,7 +48,7 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
                 '-acodec', 'libmp3lame',
                 '-compression_level', '0',  # Fastest encoding, lowest compression
                 '-b:a', BITRATE,
-                '-ar', str(SAMPLE_RATE),  # Output sample rate (44100)
+                '-ar', str(OUTPUT_SAMPLE_RATE),  # Output sample rate (44100)
                 '-ac', str(CHANNELS),
                 '-f', 'mp3',
                 '-flush_packets', '0',
